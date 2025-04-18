@@ -38,24 +38,66 @@ STAGING_PREFIX = 'data/hcfa_json/valid/mapped/staging/'
 PARQUET_PREFIX = 'data/filemaker/'
 
 def normalize_text(text):
-    """Normalize text for comparison."""
+    """
+    Normalize text for comparison. Handles both formats:
+    - "Last, First Middle" (HCFA format)
+    - "First Middle Last" (FileMaker format)
+    """
     if not text:
         return ""
+    
+    # Remove any non-alphanumeric characters except spaces and commas
     text = text.strip().upper()
+    
+    # Handle "Last, First Middle" format
+    if "," in text:
+        last, first_middle = text.split(",", 1)
+        parts = [last.strip()] + first_middle.strip().split()
+    else:
+        # Handle "First Middle Last" format
+        parts = text.split()
+        if len(parts) > 1:  # Move last name to front if we have multiple parts
+            parts = [parts[-1]] + parts[:-1]
+    
+    # Join all parts and remove any remaining non-alphanumeric chars
+    text = "".join(parts)
     chars = [char for char in text if char.isalnum()]
-    return ''.join(sorted(chars))
+    return ''.join(sorted(chars))  # Sort to handle middle name variations
 
 def parse_date(date_str):
-    """Parse date string into datetime object."""
+    """
+    Parse date string into datetime object.
+    Handles formats:
+    - YYYY-MM-DD
+    - MM/DD/YYYY
+    - MM/DD/YY
+    - MM/DD/YY - MM/DD/YY (takes first date)
+    """
     if not date_str:
         return None
-    date_formats = ["%Y-%m-%d", "%m/%d/%Y", "%Y%m%d", "%m-%d-%Y"]
+        
+    # Handle date ranges by taking the first date
+    if ' - ' in date_str:
+        date_str = date_str.split(' - ')[0]
+    
+    date_formats = [
+        "%Y-%m-%d",    # YYYY-MM-DD
+        "%m/%d/%Y",    # MM/DD/YYYY
+        "%m/%d/%y"     # MM/DD/YY - converts to 20YY for years 00-69, 19YY for 70-99
+    ]
+    
     for fmt in date_formats:
         try:
             return datetime.strptime(date_str, fmt)
         except ValueError:
             continue
     return None
+
+def date_diff_days(date1, date2):
+    """Calculate difference in days between two dates, handling None values."""
+    if date1 is None or date2 is None:
+        return float('inf')  # Return infinity if either date is None
+    return abs((date1 - date2).days)
 
 def load_orders_to_dataframe():
     """Load orders from S3 Parquet files into DataFrame."""
@@ -102,7 +144,7 @@ def get_cpts_for_order(order_id, line_items_df):
     cpts = line_items_df[line_items_df['Order_ID'] == order_id]['CPT'].dropna().unique()
     return {str(cpt).strip() for cpt in cpts}
 
-def process_matches():
+def process_mapping_s3():
     """Process JSON files and find matches in FileMaker database."""
     df_orders, df_line_items = load_orders_to_dataframe()
     
@@ -115,6 +157,7 @@ def process_matches():
     
     print(f"Found {len(json_keys)} files to process")
     processed_files = 0
+    results = []
     
     for key in json_keys:
         filename = os.path.basename(key)
@@ -131,9 +174,11 @@ def process_matches():
             original_name = json_data.get("patient_info", {}).get("patient_name", "")
             json_name = normalize_text(original_name)
             
-            dos_list = [parse_date(entry.get("date_of_service", "")) 
-                       for entry in json_data.get("service_lines", []) 
-                       if entry.get("date_of_service", "")]
+            dos_list = []
+            for entry in json_data.get("service_lines", []):
+                dos = parse_date(entry.get("date_of_service", ""))
+                if dos:
+                    dos_list.append(dos)
             
             if not json_name or not dos_list:
                 print(f"❌ Missing name or DOS: {filename}")
@@ -154,7 +199,7 @@ def process_matches():
                     
                     for json_dos in dos_list:
                         for db_dos in db_dos_list:
-                            if db_dos and abs((json_dos - db_dos).days) <= 14:
+                            if date_diff_days(json_dos, db_dos) <= 14:
                                 candidate_matches.append({
                                     'composite_score': composite_score,
                                     'token_sort_score': token_sort_score,
@@ -186,9 +231,12 @@ def process_matches():
                 best_match = enriched_matches[0][2]
             
             if best_match:
-                # Add FileMaker info to JSON
-                json_data["Order_ID"] = best_match['row']['Order_ID']
-                json_data["filemaker_number"] = best_match['row']['FileMaker_Record_Number']
+                # Add FileMaker info to JSON in a new mapping_info section
+                json_data["mapping_info"] = {
+                    "order_id": str(best_match['row']['Order_ID']),
+                    "filemaker_number": str(best_match['row']['FileMaker_Record_Number']),
+                    "mapping_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
                 
                 # Write updated JSON back to file
                 with open(local_json, 'w') as f:
@@ -227,4 +275,4 @@ def process_matches():
     print(f"\nProcessed {processed_files} files")
 
 if __name__ == "__main__":
-    process_matches()
+    process_mapping_s3()

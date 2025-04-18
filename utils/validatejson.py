@@ -34,7 +34,7 @@ S3_BUCKET = os.getenv('S3_BUCKET')
 
 # Precompiled regex patterns for critical validations
 ZIP_PATTERN = re.compile(r"^\d{5}$")
-CURRENCY_PATTERN = re.compile(r"^\$\d{1,5}(?:\.\d{2})?$")
+CURRENCY_PATTERN = re.compile(r"^\$\d{1,3}(?:,\d{3})*(?:\.\d{2})?$")
 
 def clean_name(name):
     """

@@ -7,17 +7,26 @@ writes extracted text back to S3, archives processed PDFs,
 and logs any errors.
 """
 import os
+import sys
+import logging
 import tempfile
+from pathlib import Path
 from dotenv import load_dotenv
 import boto3
 from google.cloud import vision
 from google.cloud.vision_v1 import types
 
-# Load environment variables: AWS_*, S3_BUCKET,
-# GOOGLE_APPLICATION_CREDENTIALS should be set in .env
-load_dotenv()
+# Get the project root directory (2 levels up from this file)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.append(str(PROJECT_ROOT))
 
-# Initialize S3 client via boto3 in s3_utils or directly
+# Load environment variables from the root .env file
+load_dotenv(PROJECT_ROOT / '.env')
+
+# Set credentials path relative to project root
+os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = str(PROJECT_ROOT / 'googlecloud.json')
+
+# Import S3 helper functions
 from utils.s3_utils import list_objects, download, upload, move
 
 # Initialize Vision API client
@@ -25,8 +34,8 @@ vision_client = vision.ImageAnnotatorClient()
 
 # S3 prefixes
 INPUT_PREFIX = os.getenv('OCR_INPUT_PREFIX', 'data/hcfa_pdf/')
-OUTPUT_PREFIX = os.getenv('OCR_OUTPUT_PREFIX', 'data/hcfa_txt/')
 ARCHIVE_PREFIX = os.getenv('OCR_ARCHIVE_PREFIX', 'data/hcfa_pdf/archived/')
+OUTPUT_PREFIX = os.getenv('OCR_OUTPUT_PREFIX', 'data/hcfa_txt/')
 LOG_PREFIX = os.getenv('OCR_LOG_PREFIX', 'logs/ocr_errors.log')
 S3_BUCKET = os.getenv('S3_BUCKET')
 
@@ -58,49 +67,68 @@ def ocr_pdf_with_vision(local_pdf_path: str) -> str:
 
 
 def process_ocr_s3():
-    """Iterate all PDFs in S3 input prefix, OCR, upload text, and archive."""
-    print(f"Starting OCR run against bucket: {S3_BUCKET} (prefix: {INPUT_PREFIX})")
-    pdf_keys = [key for key in list_objects(INPUT_PREFIX) if key.lower().endswith('.pdf')]
+    """Process PDFs with OCR, save text output, and archive processed PDFs."""
+    logger = logging.getLogger("OCR Processing")
+    
+    # List all PDFs in source folder (excluding archived)
+    pdf_keys = [key for key in list_objects(INPUT_PREFIX) 
+                if key.lower().endswith('.pdf') 
+                and not key.startswith(ARCHIVE_PREFIX)]
+    
+    if not pdf_keys:
+        logger.info("No PDFs found to process")
+        return
 
+    logger.info(f"Found {len(pdf_keys)} PDFs to process")
+    
     for key in pdf_keys:
-        print(f"→ Processing s3://{S3_BUCKET}/{key}")
-        local_pdf = download(key, os.path.join(tempfile.gettempdir(), os.path.basename(key)))
-        local_txt = None
+        pdf_name = Path(key).name
+        logger.info(f"Processing {pdf_name}")
+        
         try:
-            # Perform OCR
-            extracted = ocr_pdf_with_vision(local_pdf)
-            # Write text locally
-            local_txt = tempfile.mktemp(suffix='.txt')
-            with open(local_txt, 'w', encoding='utf-8') as f:
-                f.write(extracted)
+            # Create temp directory for processing
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                
+                # Download PDF
+                local_pdf = temp_path / pdf_name
+                download(key, str(local_pdf))
+                
+                # Perform OCR
+                extracted = ocr_pdf_with_vision(str(local_pdf))
+                
+                # Write text locally
+                base_name = local_pdf.stem
+                local_txt = temp_path / f"{base_name}.txt"
+                with open(local_txt, 'w', encoding='utf-8') as f:
+                    f.write(extracted)
 
-            # Upload text to S3
-            base = os.path.splitext(os.path.basename(key))[0]
-            s3_txt_key = f"{OUTPUT_PREFIX}{base}.txt"
-            upload(local_txt, s3_txt_key)
-            print(f"✔ Uploaded text to s3://{S3_BUCKET}/{s3_txt_key}")
+                # Upload text to S3
+                s3_txt_key = f"{OUTPUT_PREFIX}{base_name}.txt"
+                upload(str(local_txt), s3_txt_key)
+                logger.info(f"Saved OCR text: {s3_txt_key}")
 
-            # Archive original PDF
-            archived_key = key.replace(INPUT_PREFIX, ARCHIVE_PREFIX)
-            move(key, archived_key)
-            print(f"✔ Archived PDF to s3://{S3_BUCKET}/{archived_key}\n")
+                # Move processed PDF to archived folder
+                archive_key = f"{ARCHIVE_PREFIX}{pdf_name}"
+                move(key, archive_key)
+                logger.info(f"Archived PDF to: {archive_key}")
+
         except Exception as e:
-            err = f"❌ Error OCR {key}: {e}"
-            print(err)
-            # Write error to temp and upload
-            log_local = tempfile.mktemp(suffix='.log')
-            with open(log_local, 'a', encoding='utf-8') as logf:
-                logf.write(err + '\n')
-            upload(log_local, LOG_PREFIX)
-            os.remove(log_local)
-        finally:
-            if os.path.exists(local_pdf):
-                os.remove(local_pdf)
-            if local_txt and os.path.exists(local_txt):
-                os.remove(local_txt)
+            logger.error(f"Error processing {pdf_name}: {str(e)}", exc_info=True)
+            # Write error to log file
+            log_local = temp_path / "error.log"
+            with open(log_local, 'w', encoding='utf-8') as logf:
+                logf.write(f"Error OCR {key}: {str(e)}\n")
+            upload(str(log_local), LOG_PREFIX)
 
-    print("OCR processing complete.")
+    logger.info("OCR processing complete")
 
 
 if __name__ == '__main__':
+    # Setup basic logging when run directly
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
     process_ocr_s3()

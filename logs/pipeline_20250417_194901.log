@@ -1,0 +1,21 @@
+2025-04-17 19:49:01,887 - root - INFO - Starting HCFA preprocessing pipeline
+2025-04-17 19:49:01,890 - botocore.credentials - INFO - Found credentials in environment variables.
+2025-04-17 19:49:02,731 - S3 Initialization - INFO - Ensured S3 path exists: data/hcfa_pdf/preview/
+2025-04-17 19:49:03,382 - S3 Initialization - INFO - Ensured S3 path exists: data/hcfa_pdf/archived/
+2025-04-17 19:49:03,385 - Upload Batch - INFO - Starting Upload Batch
+2025-04-17 19:49:14,395 - Upload Batch - INFO - Completed Upload Batch
+2025-04-17 19:49:14,395 - Split HCFA Batches - INFO - Starting Split HCFA Batches
+2025-04-17 19:49:44,199 - Split HCFA Batches - INFO - Completed Split HCFA Batches
+2025-04-17 19:49:44,200 - Generate PDF Previews - INFO - Starting Generate PDF Previews
+2025-04-17 19:49:45,381 - Generate PDF Previews - INFO - Completed Generate PDF Previews
+2025-04-17 19:49:45,382 - OCR Processing - INFO - Starting OCR Processing
+2025-04-17 19:49:45,465 - OCR Processing - INFO - Completed OCR Processing
+2025-04-17 19:49:45,466 - LLM Extraction - INFO - Starting LLM Extraction
+2025-04-17 19:49:45,537 - LLM Extraction - INFO - Completed LLM Extraction
+2025-04-17 19:49:45,538 - JSON Validation - INFO - Starting JSON Validation
+2025-04-17 19:49:45,601 - JSON Validation - INFO - Completed JSON Validation
+2025-04-17 19:49:45,602 - FileMaker Mapping - INFO - Starting FileMaker Mapping
+2025-04-17 19:49:51,043 - FileMaker Mapping - INFO - Completed FileMaker Mapping
+2025-04-17 19:49:51,044 - root - INFO - 
+Pipeline Summary:
+2025-04-17 19:49:51,220 - root - INFO - Pipeline completed successfully

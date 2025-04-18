@@ -1,35 +1,44 @@
 #!/usr/bin/env python3
 """
-llm_hcfa_s3.py
+llm_hcfa.py
 
-Fetches OCR text files from S3, sends them through OpenAI to extract structured
-CMS-1500 data, saves the JSON back to S3, archives processed text files, and logs errors.
+Processes OCR text output through LLM to extract structured data.
 """
 import os
+import sys
+import logging
 import tempfile
 import json
+from pathlib import Path
 from dotenv import load_dotenv
-import openai
+from openai import OpenAI
 
-# Load environment variables: AWS_*, S3_BUCKET,
-# OPENAI_API_KEY and LLM_PROMPT_PATH should be set in .env
-load_dotenv()
+# Get the project root directory (2 levels up from this file)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.append(str(PROJECT_ROOT))
 
-# Import S3 helper functions
-from utils.s3_utils import list_objects, download, upload, move
+# Load environment variables from the root .env file
+load_dotenv(PROJECT_ROOT / '.env')
+
+# Import S3 helper functions - handle both direct script execution and module import
+try:
+    from utils.s3_utils import list_objects, download, upload, move
+except ImportError:
+    # If running directly from utils directory
+    from s3_utils import list_objects, download, upload, move
 
 # S3 prefixes (override in .env if needed)
 INPUT_PREFIX = os.getenv('LLM_INPUT_PREFIX', 'data/hcfa_txt/')
-OUTPUT_PREFIX = os.getenv('LLM_OUTPUT_PREFIX', 'data/extracts/')
+OUTPUT_PREFIX = os.getenv('LLM_OUTPUT_PREFIX', 'data/hcfa_json/')
 ARCHIVE_PREFIX = os.getenv('LLM_ARCHIVE_PREFIX', 'data/hcfa_txt/archived/')
 LOG_PREFIX = os.getenv('LLM_LOG_PREFIX', 'logs/extract_errors.log')
 S3_BUCKET = os.getenv('S3_BUCKET')
-# Resolve prompt path relative to this script
-script_dir = os.path.dirname(os.path.realpath(__file__))
-PROMPT_PATH = os.getenv('LLM_PROMPT_PATH', os.path.join(script_dir, 'gpt41_prompt.txt'))
+
+# Load prompt from project root
+PROMPT_PATH = PROJECT_ROOT / 'preprocess' / 'utils' / 'gpt41_prompt.txt'
 
 # Initialize OpenAI client
-openai.api_key = os.getenv('OPENAI_API_KEY')
+client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
 # Helper to clean charge strings
 def clean_charge(charge: str) -> str:
@@ -62,8 +71,8 @@ def extract_data_via_llm(prompt_text: str, ocr_text: str) -> str:
         {"role": "system", "content": "You are an AI assistant that extracts structured data from CMS-1500 medical claim forms."},
         {"role": "user", "content": prompt_text + "\n---\n" + ocr_text}
     ]
-    response = openai.ChatCompletion.create(
-        model="gpt-4.1-mini",
+    response = client.chat.completions.create(
+        model="gpt-4",
         messages=messages,
         temperature=0.0,
         max_tokens=1500
@@ -102,6 +111,14 @@ def process_llm_s3(limit=None):
 
             parsed = json.loads(cleaned)
             parsed = fix_all_charges(parsed)
+
+            # Print JSON structure for debugging
+            print("\nJSON Structure:")
+            print(json.dumps(parsed, indent=2))
+            print("\nChecking required fields:")
+            print(f"patient_info.patient_name: {parsed.get('patient_info', {}).get('patient_name', 'MISSING')}")
+            service_lines = parsed.get('service_lines', [])
+            print(f"service_lines[0].date_of_service: {service_lines[0].get('date_of_service', 'MISSING') if service_lines else 'NO SERVICE LINES'}")
 
             # Write JSON locally
             json_local = tempfile.mktemp(suffix='.json')

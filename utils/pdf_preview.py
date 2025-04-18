@@ -7,15 +7,25 @@ and creating three cropped sections (header, service lines, footer).
 Uses PyMuPDF (fitz) for PDF processing without system dependencies.
 """
 import os
+import sys
+import logging
 import tempfile
 import fitz  # PyMuPDF
 import boto3
 from PIL import Image
 from io import BytesIO
+from pathlib import Path
 from dotenv import load_dotenv
 
+# Get the project root directory
+project_root = Path(__file__).resolve().parents[2]
+sys.path.append(str(project_root))
+
 # Load environment variables from .env
-load_dotenv()
+load_dotenv(project_root / '.env')
+
+# Import S3 helper functions
+from utils.s3_utils import list_objects, download, upload, move
 
 def generate_pdf_previews(pdf_filename: str):
     """
@@ -24,32 +34,40 @@ def generate_pdf_previews(pdf_filename: str):
     Args:
         pdf_filename: Name of the PDF file in S3
     """
+    logger = logging.getLogger("PDF Preview")
     s3_client = boto3.client('s3')
-    bucket = 'bill-review-prod'
-    source_prefix = 'data/hcfa_pdf/archived/'
+    bucket = os.getenv('S3_BUCKET', 'bill-review-prod')
+    source_prefix = 'data/hcfa_pdf/'
     preview_prefix = 'data/hcfa_pdf/preview/'
     
-    # Create temp directory for working files
-    with tempfile.TemporaryDirectory() as temp_dir:
+    pdf_document = None
+    temp_dir = None
+    
+    try:
+        # Create temp directory for working files
+        temp_dir = tempfile.mkdtemp()
+        temp_path = Path(temp_dir)
+        
         # Download PDF from S3
-        pdf_path = os.path.join(temp_dir, pdf_filename)
+        pdf_path = temp_path / pdf_filename
         s3_client.download_file(
             bucket,
             f"{source_prefix}{pdf_filename}",
-            pdf_path
+            str(pdf_path)
         )
-        print(f"Downloaded {pdf_filename} from S3")
+        logger.info(f"Downloaded {pdf_filename} from S3")
         
         # Open PDF and convert first page to image
-        pdf_document = fitz.open(pdf_path)
+        pdf_document = fitz.open(str(pdf_path))
         first_page = pdf_document[0]
         
         # Convert to high-quality image (300 DPI)
-        pix = first_page.get_pixmap(matrix=fitz.Matrix(300/72, 300/72))
-        img_data = pix.tobytes()
+        zoom = 300 / 72  # zoom factor to achieve 300 DPI
+        mat = fitz.Matrix(zoom, zoom)  # zoom matrix
+        pix = first_page.get_pixmap(matrix=mat, alpha=False)
         
-        # Convert to PIL Image
-        image = Image.frombytes("RGB", [pix.width, pix.height], img_data)
+        # Convert to PIL Image directly from pixmap bytes
+        image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         width, height = image.size
         
         # Calculate crop dimensions
@@ -63,8 +81,7 @@ def generate_pdf_previews(pdf_filename: str):
         footer = image.crop((0, footer_start, width, height))
         
         # Get base filename without extension
-        base_filename = os.path.splitext(pdf_filename)[0]
-        preview_base_path = f"{preview_prefix}{base_filename}/"
+        base_filename = Path(pdf_filename).stem
         
         # Save and upload each section
         sections = {
@@ -75,22 +92,86 @@ def generate_pdf_previews(pdf_filename: str):
         
         for filename, img in sections.items():
             # Save image to temp file
-            temp_image_path = os.path.join(temp_dir, filename)
+            temp_image_path = temp_path / filename
             img.save(temp_image_path, 'PNG')
             
-            # Upload to S3
-            s3_key = f"{preview_base_path}{filename}"
+            # Upload to S3 in preview folder with PDF name as prefix
+            s3_key = f"{preview_prefix}{base_filename}/{filename}"
             s3_client.upload_file(
-                temp_image_path,
+                str(temp_image_path),
                 bucket,
                 s3_key,
                 ExtraArgs={'ContentType': 'image/png'}
             )
-            print(f"Uploaded {s3_key} to S3")
+            logger.info(f"Uploaded preview {s3_key}")
+            
+    except Exception as e:
+        logger.error(f"Error generating previews for {pdf_filename}: {str(e)}", exc_info=True)
+        raise
+    finally:
+        # Clean up resources
+        if pdf_document:
+            pdf_document.close()
+        if temp_dir and os.path.exists(temp_dir):
+            try:
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception as e:
+                logger.warning(f"Failed to cleanup temp directory: {str(e)}")
+
+def process_previews_s3():
+    """Process all PDFs in the source directory that don't have previews."""
+    logger = logging.getLogger("PDF Preview")
+    s3_client = boto3.client('s3')
+    bucket = os.getenv('S3_BUCKET', 'bill-review-prod')
+    source_prefix = 'data/hcfa_pdf/'
+    preview_prefix = 'data/hcfa_pdf/preview/'
+    
+    try:
+        # List all PDFs in source directory
+        pdf_files = [obj['Key'].split('/')[-1] for obj in s3_client.list_objects_v2(
+            Bucket=bucket,
+            Prefix=source_prefix
+        ).get('Contents', []) if obj['Key'].lower().endswith('.pdf')]
         
-        # Clean up
-        pdf_document.close()
+        if not pdf_files:
+            logger.info("No PDFs found to process")
+            return
+        
+        logger.info(f"Found {len(pdf_files)} PDFs to process")
+        
+        # Process each PDF that doesn't already have previews
+        for pdf_file in pdf_files:
+            try:
+                base_name = Path(pdf_file).stem
+                preview_path = f"{preview_prefix}{base_name}/"
+                
+                # Check if previews already exist
+                try:
+                    s3_client.head_object(Bucket=bucket, Key=f"{preview_path}header.png")
+                    logger.debug(f"Previews already exist for {pdf_file}")
+                    continue
+                except:
+                    logger.info(f"Generating previews for {pdf_file}")
+                    generate_pdf_previews(pdf_file)
+            except Exception as e:
+                logger.error(f"Error in preview processing: {str(e)}", exc_info=True)
+                continue
+        
+        logger.info("Preview generation complete")
+        
+    except Exception as e:
+        logger.error(f"Error in preview processing: {str(e)}", exc_info=True)
+        raise
+
+# Alias for backward compatibility
+process_pdf_previews = process_previews_s3
 
 if __name__ == '__main__':
-    # Example usage
-    generate_pdf_previews("example.pdf") 
+    # Setup basic logging when run directly
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+    process_previews_s3() 
